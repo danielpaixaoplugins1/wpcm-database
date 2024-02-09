@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: WPCM Database Monitor
- * Description: Monitors database tables and columns, provides backup and restore functionalities, and offers a user interface for database management within the WordPress admin area.
+ * Description: Monitors database tables and columns, provides backup and restore functionalities, offers a user interface for database management within the WordPress admin area, and supports scheduled backups.
  * Version: 1.4
  * Author: Daniel Oliveira da Paixao
  * Text Domain: wpcm-database-monitor
@@ -16,15 +16,29 @@ register_deactivation_hook(__FILE__, 'mdbm_deactivate_plugin');
 add_action('admin_menu', 'mdbm_admin_menu');
 add_action('activated_plugin', 'mdbm_update_database_structure');
 add_action('deactivated_plugin', 'mdbm_update_database_structure');
+add_action('wp_ajax_mdbm_create_backup', 'mdbm_ajax_create_backup');
+add_action('wp_ajax_mdbm_restore_backup', 'mdbm_ajax_restore_backup');
+add_action('admin_enqueue_scripts', 'mdbm_enqueue_scripts');
 
 function mdbm_activate_plugin() {
     mdbm_create_monitoring_table();
     mdbm_create_backup_directory();
     mdbm_initialize_monitoring();
+    mdbm_schedule_backup();
 }
 
 function mdbm_deactivate_plugin() {
     mdbm_cleanup_monitoring();
+    wp_clear_scheduled_hook('mdbm_scheduled_backup');
+}
+
+function mdbm_enqueue_scripts($hook) {
+    if ($hook !== 'toplevel_page_wpcm-database-monitor') {
+        return;
+    }
+
+    wp_enqueue_script('mdbm-admin-js', plugin_dir_url(__FILE__) . 'admin.js', ['jquery'], null, true);
+    wp_localize_script('mdbm-admin-js', 'mdbm_ajax', ['ajax_url' => admin_url('admin-ajax.php')]);
 }
 
 function mdbm_create_monitoring_table() {
@@ -48,6 +62,8 @@ function mdbm_create_backup_directory() {
     $backup_dir = WP_CONTENT_DIR . '/mdbm_backups';
     if (!file_exists($backup_dir)) {
         mkdir($backup_dir, 0755, true);
+        // Deny direct access to the backup directory
+        file_put_contents($backup_dir . '/.htaccess', 'deny from all');
     }
 }
 
@@ -80,13 +96,13 @@ function mdbm_update_database_structure() {
 
 function mdbm_create_backup() {
     if (!current_user_can('manage_options')) return false;
-    check_admin_referer('mdbm-create-backup');
+    check_ajax_referer('mdbm-create-backup', 'security');
 
     global $wpdb;
-    $backup_file_path = WP_CONTENT_DIR . '/mdbm_backups/' . $wpdb->dbname . '-' . time() . '.sql';
+    $backup_file_path = WP_CONTENT_DIR . '/mdbm_backups/' . $wpdb->dbname . '-' . time() . '.sql.gz';
 
     $command = sprintf(
-        'mysqldump --user=%s --password=%s --host=%s %s > %s',
+        'mysqldump --user=%s --password=%s --host=%s %s | gzip > %s',
         escapeshellarg(DB_USER),
         escapeshellarg(DB_PASSWORD),
         escapeshellarg(DB_HOST),
@@ -96,23 +112,23 @@ function mdbm_create_backup() {
 
     exec($command, $output, $return_var);
 
-    return $return_var === 0 ? $backup_file_path : false;
+    return $return_var === 0 ? basename($backup_file_path) : false;
 }
 
 function mdbm_restore_backup($backup_file) {
     if (!current_user_can('manage_options')) return false;
-    check_admin_referer('mdbm-restore-backup');
+    check_ajax_referer('mdbm-restore-backup', 'security');
 
-    $backup_file_path = WP_CONTENT_DIR . '/mdbm_backups/' . $backup_file;
+    $backup_file_path = WP_CONTENT_DIR . '/mdbm_backups/' . sanitize_file_name($backup_file);
     if (!file_exists($backup_file_path)) return false;
 
     $command = sprintf(
-        'mysql --user=%s --password=%s --host=%s %s < %s',
+        'gunzip < %s | mysql --user=%s --password=%s --host=%s %s',
+        escapeshellarg($backup_file_path),
         escapeshellarg(DB_USER),
         escapeshellarg(DB_PASSWORD),
         escapeshellarg(DB_HOST),
-        escapeshellarg($wpdb->dbname),
-        escapeshellarg($backup_file_path)
+        escapeshellarg($wpdb->dbname)
     );
 
     exec($command, $output, $return_var);
@@ -135,51 +151,54 @@ function mdbm_admin_page() {
         wp_die(__('You do not have sufficient permissions to access this page.'));
     }
 
+    // Nonces for AJAX actions
+    $create_backup_nonce = wp_create_nonce('mdbm-create-backup');
+    $restore_backup_nonce = wp_create_nonce('mdbm-restore-backup');
+
     echo '<div class="wrap"><h1>'.esc_html__('WPCM Database Monitor', 'wpcm-database-monitor').'</h1>';
 
-    if (isset($_POST['action']) && $_POST['action'] === 'create_backup') {
-        if (!check_admin_referer('mdbm-create-backup')) {
-            wp_die(__('Invalid nonce specified', 'wpcm-database-monitor'), __('Error', 'wpcm-database-monitor'), ['response' => 403]);
-        }
-        $backup_file = mdbm_create_backup();
-        if ($backup_file) {
-            echo '<div>' . sprintf(__('Backup created successfully: %s', 'wpcm-database-monitor'), esc_html($backup_file)) . '</div>';
-        } else {
-            echo '<div>'.esc_html__('Error creating backup.', 'wpcm-database-monitor').'</div>';
-        }
-    } elseif (isset($_POST['action'], $_POST['backup_file']) && $_POST['action'] === 'restore_backup') {
-        if (!check_admin_referer('mdbm-restore-backup')) {
-            wp_die(__('Invalid nonce specified', 'wpcm-database-monitor'), __('Error', 'wpcm-database-monitor'), ['response' => 403]);
-        }
-        if (mdbm_restore_backup($_POST['backup_file'])) {
-            echo '<div>'.esc_html__('Backup restored successfully.', 'wpcm-database-monitor').'</div>';
-        } else {
-            echo '<div>'.esc_html__('Error restoring backup.', 'wpcm-database-monitor').'</div>';
-        }
-    }
+    // AJAX button for creating backup
+    echo '<button id="mdbm-create-backup" class="button button-primary" data-nonce="' . esc_attr($create_backup_nonce) . '">' . esc_html__('Create Backup Now', 'wpcm-database-monitor') . '</button>';
 
-    // Formulário para criar backup
-    echo '<form method="post">';
-    wp_nonce_field('mdbm-create-backup');
-    echo '<input type="hidden" name="action" value="create_backup"/>';
-    submit_button(__('Create Backup Now', 'wpcm-database-monitor'), 'primary', 'submit', false);
-    echo '</form>';
-
-    // Formulário para restaurar backup
-    echo '<h2>'.esc_html__('Restore Backup', 'wpcm-database-monitor').'</h2>';
+    // List available backups for restoration
+    echo '<h2>'.esc_html__('Available Backups', 'wpcm-database-monitor').'</h2>';
     $backup_dir = WP_CONTENT_DIR . '/mdbm_backups';
     $backup_files = array_diff(scandir($backup_dir), array('..', '.'));
     
-    echo '<form method="post">';
-    wp_nonce_field('mdbm-restore-backup');
-    echo '<input type="hidden" name="action" value="restore_backup"/>';
-    echo '<select name="backup_file">';
-    foreach ($backup_files as $file) {
-        echo '<option value="' . esc_attr($file) . '">' . esc_html($file) . '</option>';
+    if (!empty($backup_files)) {
+        echo '<ul id="mdbm-backup-list">';
+        foreach ($backup_files as $file) {
+            echo '<li>' . esc_html($file) . ' <button class="mdbm-restore-backup button button-secondary" data-file="' . esc_attr($file) . '" data-nonce="' . esc_attr($restore_backup_nonce) . '">' . esc_html__('Restore', 'wpcm-database-monitor') . '</button></li>';
+        }
+        echo '</ul>';
+    } else {
+        echo '<p>'.esc_html__('No backups available.', 'wpcm-database-monitor').'</p>';
     }
-    echo '</select>';
-    submit_button(__('Restore Backup', 'wpcm-database-monitor'), 'secondary', 'submit', false);
-    echo '</form>';
 
-    echo '</div>'; // Fecha a div.wrap
+    echo '</div>'; // End of wrap
 }
+
+function mdbm_ajax_create_backup() {
+    $backup_file = mdbm_create_backup();
+    if ($backup_file) {
+        wp_send_json_success(['file' => $backup_file]);
+    } else {
+        wp_send_json_error(['message' => __('Error creating backup.', 'wpcm-database-monitor')]);
+    }
+}
+
+function mdbm_ajax_restore_backup() {
+    if (isset($_POST['file']) && mdbm_restore_backup($_POST['file'])) {
+        wp_send_json_success(['message' => __('Backup restored successfully.', 'wpcm-database-monitor')]);
+    } else {
+        wp_send_json_error(['message' => __('Error restoring backup.', 'wpcm-database-monitor')]);
+    }
+}
+
+function mdbm_schedule_backup() {
+    if (!wp_next_scheduled('mdbm_scheduled_backup')) {
+        wp_schedule_event(time(), 'daily', 'mdbm_scheduled_backup');
+    }
+}
+
+add_action('mdbm_scheduled_backup', 'mdbm_create_backup');
